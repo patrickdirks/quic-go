@@ -196,7 +196,9 @@ func (c *oobConn) ReadPacket() (receivedPacket, error) {
 		buffer := getPacketBuffer()
 		buffer.Data = buffer.Data[:protocol.MaxPacketBufferSize]
 
-		n, oobn, _, addr, err := c.customConn.ReadMsgUDP(buffer.Data, buffer.Data[len(buffer.Data):cap(buffer.Data)])
+		var oobBuf [oobBufferSize]byte
+
+		n, oobn, _, addr, err := c.customConn.ReadMsgUDP(buffer.Data, oobBuf[:])
 		if err != nil {
 			return receivedPacket{}, err
 		}
@@ -204,7 +206,7 @@ func (c *oobConn) ReadPacket() (receivedPacket, error) {
 		var ecn protocol.ECN
 		if oobn > 0 {
 			// Manually parse OOB data to extract ECN
-			oob := buffer.Data[len(buffer.Data):cap(buffer.Data)][:oobn]
+			oob := oobBuf[:oobn]
 			msgs, _ := unix.ParseSocketControlMessage(oob)
 			for _, msg := range msgs {
 				if (msg.Header.Level == unix.IPPROTO_IP && msg.Header.Type == unix.IP_TOS) ||
