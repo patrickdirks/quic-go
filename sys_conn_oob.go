@@ -28,6 +28,11 @@ const (
 	oobBufferSize = 128
 )
 
+type udpMsgConn interface {
+	ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr net.Addr, err error)
+	WriteMsgUDP(b, oob []byte, addr net.Addr) (n, oobn int, err error)
+}
+
 // Contrary to what the naming suggests, the ipv{4,6}.Message is not dependent on the IP version.
 // They're both just aliases for x/net/internal/socket.Message.
 // This means we can use this struct to read from a socket that receives both IPv4 and IPv6 messages.
@@ -65,7 +70,13 @@ func isECNDisabledUsingEnv() bool {
 }
 
 type oobConn struct {
-	OOBCapablePacketConn
+	//OOBCapablePacketConn
+	net.PacketConn
+
+	// [ADD] Logic fields
+	customConn   udpMsgConn
+	standardConn OOBCapablePacketConn
+
 	batchConn batchConn
 
 	readPos uint8
@@ -78,8 +89,29 @@ type oobConn struct {
 
 var _ rawConn = &oobConn{}
 
-func newConn(c OOBCapablePacketConn, supportsDF bool) (*oobConn, error) {
-	rawConn, err := c.SyscallConn()
+func newConn(c net.PacketConn, supportsDF bool) (*oobConn, error) {
+	// [ADD] Fast Path for Proxy
+	if custom, ok := c.(udpMsgConn); ok {
+		return &oobConn{
+			PacketConn: c,
+			customConn: custom,
+			// Proxy supports ECN, but typically not GSO or DF in this context
+			cap: connCapabilities{
+				DF:  supportsDF,
+				ECN: true,
+				GSO: false,
+			},
+		}, nil
+	}
+
+	// [EXISTING LOGIC WRAPPER]
+	// If it's not the proxy, enforce the standard OOB interface
+	oobCapable, ok := c.(OOBCapablePacketConn)
+	if !ok {
+		return nil, errors.New("connection does not support OOB")
+	}
+
+	rawConn, err := oobCapable.SyscallConn()
 	if err != nil {
 		return nil, err
 	}
@@ -137,14 +169,14 @@ func newConn(c OOBCapablePacketConn, supportsDF bool) (*oobConn, error) {
 
 	msgs := make([]ipv4.Message, batchSize)
 	for i := range msgs {
-		// preallocate the [][]byte
 		msgs[i].Buffers = make([][]byte, 1)
 	}
 	oobConn := &oobConn{
-		OOBCapablePacketConn: c,
-		batchConn:            bc,
-		messages:             msgs,
-		readPos:              batchSize,
+		PacketConn:   c,
+		standardConn: oobCapable,
+		batchConn:    bc,
+		messages:     msgs,
+		readPos:      batchSize,
 		cap: connCapabilities{
 			DF:  supportsDF,
 			GSO: isGSOEnabled(rawConn),
@@ -160,6 +192,39 @@ func newConn(c OOBCapablePacketConn, supportsDF bool) (*oobConn, error) {
 var invalidCmsgOnceV4, invalidCmsgOnceV6 sync.Once
 
 func (c *oobConn) ReadPacket() (receivedPacket, error) {
+	if c.customConn != nil {
+		buffer := getPacketBuffer()
+		buffer.Data = buffer.Data[:protocol.MaxPacketBufferSize]
+
+		n, oobn, _, addr, err := c.customConn.ReadMsgUDP(buffer.Data, buffer.Data[len(buffer.Data):cap(buffer.Data)])
+		if err != nil {
+			return receivedPacket{}, err
+		}
+
+		var ecn protocol.ECN
+		if oobn > 0 {
+			// Manually parse OOB data to extract ECN
+			oob := buffer.Data[len(buffer.Data):cap(buffer.Data)][:oobn]
+			msgs, _ := unix.ParseSocketControlMessage(oob)
+			for _, msg := range msgs {
+				if (msg.Header.Level == unix.IPPROTO_IP && msg.Header.Type == unix.IP_TOS) ||
+					(msg.Header.Level == unix.IPPROTO_IPV6 && msg.Header.Type == unix.IPV6_TCLASS) {
+					if len(msg.Data) > 0 {
+						ecn = protocol.ParseECNHeaderBits(msg.Data[0] & ecnMask)
+					}
+				}
+			}
+		}
+
+		return receivedPacket{
+			remoteAddr: addr,
+			rcvTime:    monotime.Now(), // Use standard time or monotime if available
+			data:       buffer.Data[:n],
+			buffer:     buffer,
+			ecn:        ecn,
+		}, nil
+	}
+
 	if len(c.messages) == int(c.readPos) { // all messages read. Read the next batch of messages.
 		c.messages = c.messages[:batchSize]
 		// replace buffers data buffers up to the packet that has been consumed during the last ReadBatch call
@@ -245,6 +310,7 @@ func (c *oobConn) ReadPacket() (receivedPacket, error) {
 
 // WritePacket writes a new packet.
 func (c *oobConn) WritePacket(b []byte, addr net.Addr, packetInfoOOB []byte, gsoSize uint16, ecn protocol.ECN) (int, error) {
+
 	oob := packetInfoOOB
 	if gsoSize > 0 {
 		if !c.capabilities().GSO {
@@ -264,7 +330,12 @@ func (c *oobConn) WritePacket(b []byte, addr net.Addr, packetInfoOOB []byte, gso
 			}
 		}
 	}
-	n, _, err := c.WriteMsgUDP(b, oob, addr.(*net.UDPAddr))
+	if c.customConn != nil {
+		n, _, err := c.customConn.WriteMsgUDP(b, oob, addr)
+		return n, err
+	}
+
+	n, _, err := c.standardConn.WriteMsgUDP(b, oob, addr.(*net.UDPAddr))
 	return n, err
 }
 

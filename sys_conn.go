@@ -73,7 +73,11 @@ func wrapConn(pc net.PacketConn) (rawConn, error) {
 			})
 		}
 	}
-
+	if _, ok := pc.(udpMsgConn); ok {
+		// It's our proxy! Pass it straight to the newConn constructor.
+		// Note: We cast to net.PacketConn implicitly.
+		return newConn(pc, false)
+	}
 	conn, ok := pc.(interface {
 		SyscallConn() (syscall.RawConn, error)
 	})
